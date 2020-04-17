@@ -15,7 +15,7 @@ import sys
 import shlex
 import pickle
 import tensorflow as tf
-tf.logging.set_verbosity(tf.logging.ERROR)
+#tf.logging.set_verbosity(tf.logging.ERROR)
 
 
 def main():

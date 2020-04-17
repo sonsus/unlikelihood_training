@@ -68,13 +68,16 @@ def sample_sequence(model, prefix_batch, prefix_length, continuation_length, top
 
 def mle_loss(model, batch, args):
     bsz, len = batch.pre_tru.shape
-    inp = longer_sample[:, :len-1]
+    if len>args.seqlen:# truncate
+        batch.pre_tru = batch.pre_tru[:, :args.seqlen]
+
+    inp = batch.pre_tru[:, :len-1 if len<=args.seqlen else args.seqlen-1]
     model_output = model(inp)
-    target = longer_sample[:, 1:]
+    target = batch.pre_tru[:, 1:].clone().detach()
     logits = model_output[0]
     lprobs = F.log_softmax(logits, dim=-1)
-    assert lprobs.size(0) == 1, 'We work on flat sequences'
-    loss = F.nll_loss(lprobs[0], target[0], reduction='sum')
+
+    loss = F.nll_loss(lprobs[0], target[0], reduction='mean') # reduction method on original code: 'sum'
     true_token_logits = -F.nll_loss(logits[0], target[0], reduction='none')
     ntokens = inp.numel()
 
@@ -84,6 +87,7 @@ def mle_loss(model, batch, args):
     logging_output['normalizer'] = ntokens
     logging_output['sample_size'] = ntokens
     logging_output['ntokens'] = ntokens
+
 
     loss = loss / ntokens
     return loss, logging_output
@@ -240,21 +244,41 @@ def eval_singletoken(model, args, dataset_paths, train_iter=None):
 
 
 def main():
+    '''
+    python -m ipdb run_gpt2.py      \
+        --data-path /workheruguidednlg/data/americanlit/     \
+        --output-dir /workhere/fairseq/fairseq/checkpoint/gpt2/dbg     \
+        --eval-split valid     \
+        --train-n-steps 20000     \
+        --validate-every 1000     \
+        --sequence-tune-rate 0.0     \
+        --mode train \
+        --debug \
+        --model-name from_scratch \
+        --batch-size 64 --seqlen 80
+
+    '''#with this bsz, seqlen, fits to bm gpus
+
+
     parser = argparse.ArgumentParser(description='openGPT-2 analysis')
+
+    #debug menu
     parser.add_argument('--debug', action='store_true', help='use dbg1000.jsonl for faster programming')
 
+    #training options
+    #--> consider redefining FT...
     parser.add_argument('--mode', choices=['train', 'FT', 'eval-singletoken', 'eval-completion', 'eval-both'], default='eval-singletoken')
     parser.add_argument('--input-mode', choices=['CLM', 'relFT'], default='CLM', help='determine whether or not to put specials amongst sentences (CLM => do not  /  relFT => do)')
     parser.add_argument('--data-path', default='../jsonlpath/DBG', help='path/to/jsonl/files')
 
     parser.add_argument('--eval-split', choices=['train', 'valid', 'test'])
-    parser.add_argument('--model-name', choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
+    parser.add_argument('--model-name', choices=['from_scratch', 'gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
     parser.add_argument('--model-load-dir', type=str, default=None)
     parser.add_argument('--seed', type=int, default=777)
     #parser.add_argument('--data-base', type=str)
     parser.add_argument('--num-train-epochs', type=int, default=1)
     parser.add_argument('--batch-size', type=int, default=32)
-    parser.add_argument('--seqlen', type=int, default=100)
+    parser.add_argument('--seqlen', type=int, default=120)
     parser.add_argument('--seqlen-singletoken', type=int, default=1024)
     parser.add_argument('--seqlen-completion', type=int, default=300) # need to unify both and use only one
     parser.add_argument('--seqlen-train', type=int, default=300)
@@ -314,6 +338,7 @@ def main():
     ## root / 'flattened_amerlit.txt'
     if args.mode == 'FT':
         tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+
     elif args.mode == 'train': # train tokenizer based on corpus
         d_root = Path(args.data_path)
         vocab_path = d_root / 'vocab.json'
@@ -339,8 +364,17 @@ def main():
 
     if args.model_load_dir:
         model = GPT2LMHeadModel.from_pretrained(args.model_load_dir)
+    elif args.model_name =='from_scratch':
+        config = GPT2Config()
+        config.architectures = ["GPT2LMHeadModel"]
+        model = GPT2LMHeadModel(config)
+
+        #mp = GPT2LMHeadModel.from_pretrained('gpt2')
+        #pretrained config vs GPT2Config has only difference
+        # "architectures": ['GPT2LMHeadModel']
     else:
         model = GPT2LMHeadModel.from_pretrained(args.model_name)
+
 
     model.resize_token_embeddings(len(tokenizer))
     model.config.output_hidden_states = True # make them return output hidden
