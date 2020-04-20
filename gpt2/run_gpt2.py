@@ -246,16 +246,15 @@ def eval_singletoken(model, args, dataset_paths, train_iter=None):
 def main():
     '''
     python -m ipdb run_gpt2.py      \
-        --data-path /workheruguidednlg/data/americanlit/     \
-        --output-dir /workhere/fairseq/fairseq/checkpoint/gpt2/dbg     \
+        --data-path /workhere/nluguidednlg/data/americanlit/     \
+        --output-dir /workhere/fairseq/fairseq/checkpoint/gpt2/amerlit-train/     \
         --eval-split valid     \
         --train-n-steps 20000     \
         --validate-every 1000     \
         --sequence-tune-rate 0.0     \
         --mode train \
-        --debug \
         --model-name from_scratch \
-        --batch-size 64 --seqlen 80
+        --batch-size 32 --seqlen 80 --gradient-accumulation-steps 2
 
     '''#with this bsz, seqlen, fits to bm gpus
 
