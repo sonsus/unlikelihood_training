@@ -33,6 +33,8 @@ from ipdb import set_trace
 from fairseq.custom.gpt2.dataload import *
 from pathlib import Path
 from tokenizers import ByteLevelBPETokenizer #Lang Gen example collab: https://colab.research.google.com/github/huggingface/blog/blob/master/notebooks/01_how_to_train.ipynb#scrollTo=G-kkz81OY6xH
+from torch.nn.utils.rnn import pad_sequence
+from fairseq.custom.gpt2.losses import TPLoss_w_Cosdist as tploss
 
 RETOK = re.compile(r'\w+|[^\w\s]|\n', re.UNICODE)
 
@@ -66,19 +68,75 @@ def sample_sequence(model, prefix_batch, prefix_length, continuation_length, top
     return output, continuation_logits
 
 
+def truncate_batch(args, batch:Batch, forcls=False, tokenizer=None)->Batch:
+    #this works both for 2D and 3D tensors
+    #bsz, (n_choice, ) len --> bsz, (n_choice, ) min(len, args.seqlen)
+    if forcls:#for TPLoss cls
+        indices = (batch==tokenizer.cls_token_id).long().to_sparse().indices().t()
+
+        #mask = mask.bool() #for pytorch 1.4.0
+        # batch pre_tru: bsz, seqlen
+        if batch.dim()==2:
+            mask = (0 * batch.clone())
+            for line, idx in enumerate(indices):
+                if idx[1]-(args.seqlen+args.tolerate_offset)<0: #cls token location is within cover from 0
+                    mask[idx[0], :args.seqlen+args.tolerate_offset] = 1
+                else:
+                    #in this case, mask need to be specified
+                    #and then cls location would change for masked out batch
+                    start = idx[1]-(args.seqlen+args.tolerate_offset-1)
+                    mask[idx[0], start:idx[1]+1]
+                    indices[line, 1] = idx[1] - start #  len(cleaved front of the seq) == start
+        #batch is pre_fals: bsz, choices, seqlen
+        elif batch.dim()==3:
+            bsz, choices, len = batch.shape
+            batch = batch.view(-1,len)
+            mask = (0 * batch.clone())
+            for line, idx in enumerate(indices):
+                assert line == idx[0]*choices + idx[1], f"check def truncate_batch @ run_gpt2.py"
+                if idx[2] - (args.seqlen+args.tolerate_offset)<0:
+                    mask[idx[0]*choices + idx[1],:args.seqlen+args.tolerate_offset]
+                else:
+                    start = idx[2]-(args.seqlen+args.tolerate_offset-1)
+                    mask[line, start:idx[2]+1]
+                    indices[line, 2] = idx[2] - start
+        else:
+            assert False, f"batch.dim() == {batch.dim()} which is not expected (2 or 3 is desirable)"
+
+        modifbatch = batch[mask]
+        if len(modifbatch) > args.batch_size:
+            modifbatch = modifbatch.view(bsz, choices, -1)
+            assert modifbatch.shape[-1] == args.seqlen + args.tolerate_offset
+
+        return modifbatch, indices
+
+    else:# mle training, truncate
+        len = batch.shape[-1]
+        if len > args.seqlen:
+            batch = batch[..., :args.seqlen]
+        return batch
+
 def mle_loss(model, batch, args):
-    bsz, len = batch.pre_tru.shape
-    if len>args.seqlen:# truncate
-        batch.pre_tru = batch.pre_tru[:, :args.seqlen]
+    print("before", batch.pre_tru.shape)
+    batch.pre_tru = truncate_batch(args, batch.pre_tru)
+    bsz, newlen = batch.pre_tru.shape
 
-    inp = batch.pre_tru[:, :len-1 if len<=args.seqlen else args.seqlen-1]
+    inp = batch.pre_tru
+    print("after", batch.pre_tru.shape)
+    set_trace()
     model_output = model(inp)
-    target = batch.pre_tru[:, 1:].clone().detach()
-    logits = model_output[0]
-    lprobs = F.log_softmax(logits, dim=-1)
+    target = batch.pre_tru[:, 1:].clone().detach() # bsz, newlen
+    logits = model_output[0] # bsz, newlen, vocabsize
+    _, __, vocabsize = logits.shape
 
-    loss = F.nll_loss(lprobs[0], target[0], reduction='mean') # reduction method on original code: 'sum'
-    true_token_logits = -F.nll_loss(logits[0], target[0], reduction='none')
+    lprobs = F.log_softmax(logits, dim=-1) # bsz, newlen
+
+    loss = F.nll_loss(lprob.view(-1, vocabsize).contiguous(), target.view(-1).contiguous(), reduction='mean') # reduction method on original code: 'sum'
+    true_token_logits = -F.nll_loss(logits.view(-1, vocabsize).contiguous(), target.view(-1).contiguous(), reduction='none')
+    #flatten shape of batches --> recover shape
+    assert len(true_token_logits) == newlen * bsz
+    true_token_logits = true_token_logits.view(bsz, newlen)
+
     ntokens = inp.numel()
 
 
@@ -87,13 +145,64 @@ def mle_loss(model, batch, args):
     logging_output['normalizer'] = ntokens
     logging_output['sample_size'] = ntokens
     logging_output['ntokens'] = ntokens
+    '''logging_output = { # from fairseq.custom.metrics
+            'target_rank': utils.item(target_rank.data),
+            'hits_at_1': utils.item(hits_at_1.data),
+            'hits_at_10': utils.item(hits_at_10.data),
+            'median_target_rank': utils.item(median_target_rank),  # NOTE: different normalization since it's not a sum
+            'normalizer': ntokens,
+            'repeat_topk/p_{}':
+            'wrepeat_topk/p_{}':
+            'nextunique_topk/p_{}':
+        }'''
 
 
-    loss = loss / ntokens
+    #loss = loss / ntokens #covered above with reduction method
     return loss, logging_output
 
 def tp_loss(model, batch, args):
-    longer_sample = batch[0].cuda() # batches are sorted following its length
+
+    tok = batch.tokenizer # same tokenizer with dataloader
+
+    batch.pre_tru_add, cls_tru_indices= truncate_batch(args, batch.pre_tru_add, forcls=True, tokenizer=tok)
+    batch.pre_fals_add, cls_fals_indices = truncate_batch(args, batch.pre_fals_add, forcls=True, tokenizer=tok) # these need to contain cls and sep already
+
+    bsz, n_choice, seqlen = batch.pre_fals_add.shape
+
+    logits = model(batch.pre_tru)[0]
+    predicted = F.log_softmax(logits, dim=-1).argmax(dim=-1) #later replace this with nucleus sampling option
+
+
+    def filter_and_add_cls_on_predicted_ys(predicted, premise_lengths, tokenizer):
+        predicted_ys = [xy_[l:] for xy_, l in zip(predicted.unbind(0), premise_lengths) ]
+        masks = [t!=tokenizer.pad_token_id for t in predicted_ys]
+        predicted_ys_cls = [torch.cuda.LongTensor(y[m].tolist() + [tokenizer.cls_token_id]) for y, m in zip(predicted_ys, masks)]
+
+        return predicted_ys_cls
+
+    #here batch.premise_lengths contains premise length w/o [sep] token
+    predicted_ys_cls = filter_and_add_cls_on_predicted_ys(predicted, batch.premise_lengths, tokenizer)
+    premise_sep_ys_cls = [torch.cat(pre, y) for pre, y in zip(batch.premises_tensors, predicted_ys_cls)]
+
+    b_premise_sep_ys_cls = pad_sequence(premise_sep_ys_cls, padding_value = tokenizer.pad_token_id)
+    b_premise_sep_ys_cls, cls_pred_indices = truncate_batch(args, b_premise_sep_ys_cls, forcls=True, tokenizer=tok)
+
+    # GPT2LMHeadModel has self.transformer == GPT2Model which returns last hidden as a main output
+    # model.transformer.config.output_hidden_states == True (when declaring the model we forced it)
+    cls_tru_hids = model.transformer(batch.pre_tru_add)[0].index_select(dim=1, )
+    cls_pred_hids = model.transformer(b_premise_sep_ys_cls)[0]
+    cls_fals_hids = model.transformer(batch.pre_fals_add.view(-1, seqlen))[0] #bsz*nchoices seqlen hsz
+
+    cls_tru = cls_tru_hids.index_select(1, cls_tru_indices[:,1])
+    cls_pred = cls_pred_hids.index_select(1, cls_pred_indices[:,1]) #indices.shape == bsz 2
+    cls_fals = cls_fals_hids.index_select(1, cls_fals_indices[:,2]) #fals_indices.shape == bsz*nnhoices 3
+    cls_fals = cls_fals.view(bsz, n_choice, -1)
+
+    loss_fn = tploss(neg = args.negex, reduction='mean')
+    loss = loss_fn(cls_pred, cls_tru, cls_fals)
+    set_trace() #this part need to be speculated with false_examples
+
+    return loss
 
 
 def ul_seq(model, batch, args):
@@ -246,15 +355,15 @@ def eval_singletoken(model, args, dataset_paths, train_iter=None):
 def main():
     '''
     python -m ipdb run_gpt2.py      \
-        --data-path /workhere/nluguidednlg/data/americanlit/     \
-        --output-dir /workhere/fairseq/fairseq/checkpoint/gpt2/amerlit-train/     \
+        --data-path /path/to/americanlit/     \
+        --output-dir path/to/checkpoint/     \
         --eval-split valid     \
         --train-n-steps 20000     \
         --validate-every 1000     \
         --sequence-tune-rate 0.0     \
         --mode train \
         --model-name from_scratch \
-        --batch-size 32 --seqlen 80 --gradient-accumulation-steps 2
+        --batch-size 32 --seqlen 80 --gradient-accumulation-steps 4
 
     '''#with this bsz, seqlen, fits to bm gpus
 
@@ -275,9 +384,22 @@ def main():
     parser.add_argument('--model-load-dir', type=str, default=None)
     parser.add_argument('--seed', type=int, default=777)
     #parser.add_argument('--data-base', type=str)
-    parser.add_argument('--num-train-epochs', type=int, default=1)
+
     parser.add_argument('--batch-size', type=int, default=32)
+    parser.add_argument("--max-steps", default=-1, type=int,
+                        help="If > 0: set total number of training \
+                            steps to perform. Override num_train_epochs.")
+    parser.add_argument('--num-train-epochs', type=int, default=1)
+    parser.add_argument('--gradient-accumulation-steps', type=int, default=1,
+                        help="Number of updates steps to accumulate before\
+                            performing a backward/update pass.")
     parser.add_argument('--seqlen', type=int, default=120)
+    parser.add_argument('--tolerate_offset', type=int, default=20, help='when training with TPLoss, length to be additionally tolerated to args.seqlen.')
+    #training is done upto this step. regardless of args.max_steps or args.num_train_epochs
+    parser.add_argument('--train-n-steps', type=int, default=-1)#10000)
+
+
+
     parser.add_argument('--seqlen-singletoken', type=int, default=1024)
     parser.add_argument('--seqlen-completion', type=int, default=300) # need to unify both and use only one
     parser.add_argument('--seqlen-train', type=int, default=300)
@@ -297,19 +419,16 @@ def main():
     parser.add_argument('--report-metrics-every', type=int, default=10)
     parser.add_argument('--save-every', type=int, default=1000)
     parser.add_argument('--sequence-ngram-n', type=int, default=4)
-    parser.add_argument('--train-n-steps', type=int, default=10000)
+
+
     parser.add_argument('--validate-every', type=int, default=10000)
 
     # training loop
     parser.add_argument("--adam-epsilon", default=1e-8, type=float,
                         help="Epsilon for Adam optimizer.")
     parser.add_argument('--max-grad-norm', type=int, default=1)
-    parser.add_argument("--max-steps", default=-1, type=int,
-                        help="If > 0: set total number of training \
-                            steps to perform. Override num_train_epochs.")
-    parser.add_argument('--gradient-accumulation-steps', type=int, default=1,
-                        help="Number of updates steps to accumulate before\
-                            performing a backward/update pass.")
+
+
     parser.add_argument('--learning-rate', type=float, default=6.25e-5)
     parser.add_argument("--warmup-steps", default=0, type=int,
                         help="Linear warmup over warmup_steps.")
@@ -341,7 +460,7 @@ def main():
     elif args.mode == 'train': # train tokenizer based on corpus
         d_root = Path(args.data_path)
         vocab_path = d_root / 'vocab.json'
-        rawtxt_path = d_root / 'flattened_amerlit.txt'
+        rawtxt_path = d_root / 'flattened_amerlit.txt' # this is obtained by running "python 4_flatten4vocab.py @ dataroot"
         merge_path = d_root / 'merges.txt'
 
         if not (vocab_path.exists() and merge_path.exists()): #check if vocab file exists
@@ -434,25 +553,30 @@ def main():
             os.makedirs(os.path.join(args.output_dir, 'best'))
 
         token_loss = mle_loss
-        if not args.debug:
-            train_seq_dataloader = get_dataloaders(args, tokenizer, spl='train')
-        else: # debugging mode
+        if args.debug:
             train_seq_dataloader = get_dataloaders(args, tokenizer, spl='dbg1000')
             #for batch in train_seq_dataloader:
                 #print(batch.pre_tru.shape)
                 #print(batch.pre_fals) # None
                 #set_trace()
-        ### replaced by get_dataloaders() @ dataload.py
-        #datasets = get_datasets(dataset_paths, max_len=args.train_batch_size)
-        #train_sampler = RandomSampler(datasets['train'])
-        #train_seq_dataloader = DataLoader(datasets['train'], sampler=train_sampler, batch_size=1)
+        else: # debugging mode
+            train_seq_dataloader = get_dataloaders(args, tokenizer, spl='train')
 
         # Setup optimizer
+
+        # one of both need to be specified for training
+        # args.num_train_epochs  /   args.max_steps
         if args.max_steps > 0:
             t_total = args.max_steps
             args.num_train_epochs = args.max_steps // (args.batch_size * len(train_seq_dataloader) // args.gradient_accumulation_steps) + 1
+
+            #if performing gradient accumulation, steps won't update.
+            #this means actual epochs training multiplied directly by "gradient_accumulation_steps"
+
         else:
             t_total = len(train_seq_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
+
+            #if not specified,
 
         param_optimizer = list(model.named_parameters())
         no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
@@ -469,7 +593,7 @@ def main():
             logging_outputs = []
             epoch_loss = 0
             epoch_steps = 0
-            tqdm_bar = tqdm(train_seq_dataloader, desc="Training", total=args.train_n_steps)
+            tqdm_bar = tqdm(train_seq_dataloader, desc="Training", total=t_total if args.train_n_steps <=1 else args.train_n_steps)
             for step, batch in enumerate(tqdm_bar):
                 optimizer.zero_grad()
 
@@ -481,7 +605,7 @@ def main():
 
                 # Token loss
                 else:
-                    loss, batch_metrics = token_loss(model, batch, args)
+                    loss, batch_metrics = token_loss(model, batch, args) # == mleloss(model, batch, args)
 
                 loss.backward()
                 optimizer.step()
@@ -489,7 +613,8 @@ def main():
                 epoch_loss += loss.item()
                 epoch_steps += 1
                 total_steps += 1
-                tqdm_bar.desc = "Training loss: {:.2e} lr: {:.2e}".format(epoch_loss/epoch_steps, scheduler.get_lr()[0])
+                tqdm_bar.desc = f"Training loss: {(epoch_loss/epoch_steps):.2f} lr: {scheduler.get_lr()[0]:.2f}" # get_last_lr in pytorch 1.4.0
+                #tqdm_bar.desc = "Training loss: {:.2e} lr: {:.2e}".format(epoch_loss/epoch_steps, scheduler.get_lr()[0]) # scheduler.get_last_lr() is for 1.4.0
 
                 logging_outputs.append(batch_metrics)
 
@@ -503,7 +628,7 @@ def main():
                     logging_outputs = []
 
                 if step == args.train_n_steps:
-                    break
+                    break # here train_n_steps
 
                 if epoch_steps % args.save_every == 0:
                     model_to_save = model.module if hasattr(model, 'module') else model

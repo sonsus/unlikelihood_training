@@ -17,7 +17,7 @@ from fairseq import utils
 from nltk import ngrams
 
 
-class TrainingMetrics(object):
+class TrainingMetrics(object): # it is used only on single token routines (mle, tokenlv_repetition)
     REPEAT_CONTEXT_LENGTHS = [16, 32, 128, 512]
     METRIC_NAMES = ['target_rank', 'median_target_rank',
                     'hits_at_1', 'hits_at_10']
@@ -185,7 +185,7 @@ class Metrics(object):
         return metrics
 
 
-def ngram_metrics(token_list, pad=1):
+def ngram_metrics(token_list, pad=1): # this is ngram repeat measure
     if pad in token_list:
         token_list = token_list[:token_list.index(pad)]  # remove possible padding
     stats = defaultdict(float)

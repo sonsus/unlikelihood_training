@@ -32,10 +32,14 @@ def init_special_tokens(tokenizer):
 
 
 
+'''dataloader always need to load things w/o special tokens
+
+only when needed, add special tokens with provided functions below
+'''
 
 #lets add cls and sep tokens first, and then remove it for pretraining
 def concat_process(text1, text2, tokenizer, mode):
-    if mode == 'relFT':
+    if mode == 'relFT': #looks like it never used
         return f"{tokenizer.bos_token} {text1} {tokenizer.sep_token} {text2} {tokenizer.cls_token}"
     elif mode == 'CLM':
         return f"{text1} {text2}"
@@ -64,13 +68,20 @@ class Example:
 
         #concat
         #self.pre_tru, self.pre_tru_id = tokenizer.encode_plus( gpt_build_with_specials(self.premise, self.true_h, tokenizer), add_special_tokens=True, return_token_type_ids=True)
-        self.pre_tru = self.tokenizer.encode_plus( concat_process(self.premise, self.true_h, self.tokenizer, mode= args.input_mode) )['input_ids']
+        self.pre_tru = self.tokenizer.encode_plus( concat_process(self.premise, self.true_h, self.tokenizer, mode= 'CLM') )['input_ids']
+        self.pre_tru_add = self.tokenizer.encode_plus( concat_process(self.premise, self.true_h, self.tokenizer, mode= 'relFT') )['input_ids'] if args.input_mode=='relFT' else []
+
+        self.premise_token_ids = self.tokenizer.encode_plus(self.premise)
+        self.premise_length = len(self.premise_token_ids)
+
+        self.premise_token_ids.append(self.tokenizer.sep_token_id)#add this after defining length so that we don't need to modify the length
 
         if obj['false_hs']:
             if obj['false_hs'][0]: # to avoid index error, checked stepwise
                 #tups_list = [tokenizer(self.premise, n, add_special_tokens=True, return_token_type_ids=True) for n in obj['false_hs'] ]
 
-                self.pre_fals = [self.tokenizer.encode_plus( concat_process(self.premise, n, self.tokenizer, mode= args.input_mode)['input_ids']) for n in obj['false_hs'] ]
+                self.pre_fals = [self.tokenizer.encode_plus( concat_process(self.premise, n, self.tokenizer, mode= 'CLM')['input_ids']) for n in obj['false_hs'] ]
+                self.pre_fals_add = [self.tokenizer.encode_plus( concat_process(self.premise, n, self.tokenizer, mode= 'relFT')['input_ids']) for n in obj['false_hs'] if args.input_mode=='relFT' ]
                 #self.pre_fals_id = [tup[1] for tup in tups_list]
                 self.n_false = len(self.pre_fals)
                 if self.n_false > 1:
@@ -100,10 +111,15 @@ class Batch:
         def longtensors(obj:List[List[int]])->List[torch.Tensor]:
             return [torch.Tensor(l).long() if l else self.tokenizer.pad_token_id*torch.ones(1).long() for l in obj]
 
+        def longtensors_wdevice(obj:List[List[int]])->List[torch.cuda.Tensor]:
+            return [to_device(torch.Tensor(l).long() if l else self.tokenizer.pad_token_id*torch.ones(1).long()) for l in obj]
+
         def make_it_batched(listofexamples, tokenizer):
             #pre_tru, pre_tru_id, pre_fals, pre_fals_id = [], [], [], []
-            pre_tru, pre_fals = [], []
-            premises, true_hs, false_hs_s = [], [], [],
+            pre_tru, pre_fals = [], [],
+            pre_tru_add, pre_fals_add = [], []
+            premises, true_hs, false_hs_s = [], [], []
+            premises_tensors, premises_lengths = [], []
             for ex in listofexamples:
                 pre_tru.append(ex.pre_tru)
                 #pre_tru_id.append(ex.pre_tru_id)
@@ -112,21 +128,38 @@ class Batch:
                     #pre_fals_id.append(ex.pre_fals_id)
                 premises.append(ex.premise)
                 true_hs.append(ex.true_h)
+
+                premises_tensors.append(ex.premise_token_ids)
+                premises_lengths.append(ex.premise_length)
+
                 if self.n_false>0:
                     false_hs_s.append(ex.false_hs)
 
+                if ex.pre_tru_add and ex.pre_fals_add: # when special tokens added encoded tokens are
+                    pre_tru_add.append(ex.pre_tru_add)
+                    pre_fals_add.append(ex.pre_fals_add)
+
             pre_tru, pre_fals = longtensors(pre_tru), longtensors(pre_fals)
+            premises_tensors = longtensors_wdevice(premises_tensors)
+            pre_tru_add = longtensors(pre_tru_add)
+            pre_fals_add = longtensors(pre_fals_add)
+
             pre_tru = pad_sequence(pre_tru, batch_first=True, padding_value=tokenizer.pad_token_id)
             #pre_tru_id = pad_sequence(pre_tru_id, batch_first=True, padding_value=1)
             if self.n_false>0:
                 pre_fals = pad_sequence(pre_fals, batch_first=True, padding_value=tokenizer.pad_token_id)
             #pre_fals_id = pad_sequence(pre_fals_id, batch_first=True, padding_value=1)
 
+            pre_tru_add = pad_sequence(pre_tru_add, batch_first=True, padding_value=tokenizer.pad_token_id)
+            pre_fals_add = pad_sequence(pre_fals_add, batch_first=True, padding_value=tokenizer.pad_token_id)
+
             #return pre_tru, pre_tru_id, pre_fals, pre_fals_id, premises, true_hs, false_hs_s
-            return to_device(pre_tru), to_device(pre_fals), premises, true_hs, false_hs_s
+            return to_device(pre_tru), to_device(pre_fals), to_device(pre_tru_add), to_device(pre_fals_add), premises_tensors, premises_lengths, premises, true_hs, false_hs_s
 
         #self.pre_tru, self.pre_tru_id, self.pre_fals, self.pre_fals_id, \
         self.pre_tru,  self.pre_fals,  \
+        self.pre_tru_add, self.pre_fals_add, \
+        self.premises_tensors, self.premises_lengths, \
         self.premises, self.true_hs, self.false_hs_s = make_it_batched(listofexamples, tokenizer)
 
         assert len(self.pre_tru) == self.batch_size
